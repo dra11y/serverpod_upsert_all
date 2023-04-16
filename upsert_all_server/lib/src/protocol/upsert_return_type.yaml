@@ -1,0 +1,5 @@
+enum: UpsertReturnType
+values:
+  - inserted
+  - updated
+  - unchanged
