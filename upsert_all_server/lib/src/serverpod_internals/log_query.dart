@@ -1,9 +1,9 @@
-// Currently internal in Serverpod, so recreating it here for now.
-import 'dart:typed_data';
+// ignore_for_file: invalid_use_of_internal_member
 
 import 'package:serverpod/protocol.dart';
 import 'package:serverpod/serverpod.dart';
 
+// Currently internal in Serverpod, so recreating it here for now.
 void logQuery(
   Session session,
   String query,
@@ -47,30 +47,4 @@ void logQuery(
   session.serverpod.logManager.logQuery(session, entry);
   session.sessionLogs.currentLogOrderId += 1;
   session.sessionLogs.numQueries += 1;
-}
-
-T? _formatTableRow<T extends TableRow>(
-    SerializationManager serializationManager,
-    String tableName,
-    Map<String, dynamic>? rawRow) {
-  var data = <String, dynamic>{};
-
-  for (var columnName in rawRow!.keys) {
-    var value = rawRow[columnName];
-
-    if (value is DateTime) {
-      data[columnName] = value.toIso8601String();
-    } else if (value is Uint8List) {
-      var byteData = ByteData.view(
-        value.buffer,
-        value.offsetInBytes,
-        value.length,
-      );
-      data[columnName] = byteData.base64encodedString();
-    } else {
-      data[columnName] = value;
-    }
-  }
-
-  return serializationManager.deserialize<T>(data);
 }

@@ -7,23 +7,10 @@
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
 import 'package:serverpod/serverpod.dart' as _i1;
-import '../endpoints/module_endpoint.dart' as _i2;
 
 class Endpoints extends _i1.EndpointDispatch {
   @override
   void initializeEndpoints(_i1.Server server) {
-    var endpoints = <String, _i1.Endpoint>{
-      'module': _i2.ModuleEndpoint()
-        ..initialize(
-          server,
-          'module',
-          'upsert_all',
-        )
-    };
-    connectors['module'] = _i1.EndpointConnector(
-      name: 'module',
-      endpoint: endpoints['module']!,
-      methodConnectors: {},
-    );
+    var endpoints = <String, _i1.Endpoint>{};
   }
 }
