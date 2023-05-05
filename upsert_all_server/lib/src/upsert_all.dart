@@ -211,7 +211,11 @@ Current type was $T''');
       rethrow;
     }
 
-    logQuery(session, query, startTime, numRowsAffected: resultsMap.length);
+    /// "The count is the number of rows inserted or updated."
+    /// Thus, count of unchanged rows is not included in `numRowsAffected`.
+    /// Documented under "Outputs": https://www.postgresql.org/docs/current/sql-insert.html#id-1.9.3.152.7
+    logQuery(session, query, startTime,
+        numRowsAffected: resultsMap.changed.length);
   }
 
   print(
