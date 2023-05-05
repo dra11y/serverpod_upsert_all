@@ -61,6 +61,8 @@ Current type was $T''');
       columnsList.map((columnName) => '"$columnName"').toList();
   final onConflictColumnsList =
       uniqueBy.map((column) => '"${column.columnName}"').toList();
+  final skipUpdate =
+      onConflictColumnsList.every((col) => quotedColumnsList.contains(col));
   final excludedCriteriaColumnsList = excludedCriteriaColumns
       .map((column) => '"${column.columnName}"')
       .toList();
@@ -68,15 +70,30 @@ Current type was $T''');
       nonUpdatableColumns.map((column) => '"${column.columnName}"').toList();
 
   final tableName = table.tableName;
-  final insertColumns =
-      quotedColumnsList.where((column) => column != '"id"').join(', ');
+  final insertColumns = columnsList
+      .where((column) => column != 'id')
+      .map((col) => '"$col"')
+      .join(', ');
+  final insertColumnsWithTypes = columnsList
+      .where((column) => column != 'id')
+      .map((col) =>
+          columnTypes[col] != null ? '"$col"::${columnTypes[col]!}' : '"$col"')
+      .join(', ');
+  final insertColumnsForCompareWithJsonB =
+      insertColumnsWithTypes.replaceAll(RegExp('(?<!jsonb)::json'), '::jsonb');
+  // print('insertColumnsForCompareWithJsonB = $insertColumnsForCompareWithJsonB');
   final updateSetList = quotedColumnsList
       .where((column) => !nonUpdatableColumnsList.contains(column))
       .map((column) => '$column = input_values.$column')
       .join(',\n    ');
   final quotedOnConflicts = onConflictColumnsList.join(', ');
   final updateWhere = onConflictColumnsList
-      .map((column) => '$tableName.$column = input_values.$column')
+      .map((column) =>
+          '$tableName.$column IS NOT DISTINCT FROM input_values.$column')
+      .join(' AND ');
+  final updateWhereNotExistsInserted = onConflictColumnsList
+      .map((column) =>
+          '$tableName.$column IS NOT DISTINCT FROM inserted_rows.$column')
       .join(' AND ');
   final distinctOrConditionsList = quotedColumnsList
       .where((column) =>
@@ -94,16 +111,17 @@ Current type was $T''');
 
   final selectResultsUnion = [
     if (returning.contains(UpsertReturnType.inserted))
-      "SELECT id, *, ${UpsertReturnType.inserted.index} AS \"returnType\" FROM inserted_rows",
-    if (returning.contains(UpsertReturnType.updated))
-      "SELECT id, *, ${UpsertReturnType.updated.index} AS \"returnType\" FROM updated_rows",
+      "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.inserted.index} AS \"returnType\" FROM inserted_rows",
+    if (!skipUpdate && returning.contains(UpsertReturnType.updated))
+      "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.updated.index} AS \"returnType\" FROM updated_rows",
     if (returning.contains(UpsertReturnType.unchanged))
-      "SELECT id, *, ${UpsertReturnType.unchanged.index} AS \"returnType\" FROM unchanged_rows",
+      "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.unchanged.index} AS \"returnType\" FROM unchanged_rows",
   ].join(' UNION ALL ');
 
   var index = 0;
   for (var batch in batches) {
-    print("Batch $index of ${batches.length}");
+    print(
+        "upsertAll $tableName batch ${index + 1} of ${batches.length}, size = $batchSize, start = ${index * batchSize}, length = ${batch.length}");
     index++;
 
     var valuesList = batch
@@ -112,15 +130,10 @@ Current type was $T''');
           final rowValues = [];
           for (var column in columns) {
             final columnName = column.columnName;
-            // final isJson = column is ColumnSerializable;
-            // double-quote JSON values, but not other values.
-            // var convertedValue = isJson
-            //     ? '"${data[columnName]}"'
-            //     : DatabasePoolManager.encoder.convert(data[columnName]);
             var convertedValue =
                 DatabasePoolManager.encoder.convert(data[columnName]);
             if (index == 0) {
-              print('columnName $columnName type = ${columnTypes[columnName]}');
+              // print('columnName $columnName type = ${columnTypes[columnName]}');
               convertedValue += '::${columnTypes[columnName]}';
             }
             rowValues.add(convertedValue);
@@ -133,28 +146,35 @@ Current type was $T''');
     final inputValues =
         valuesList.map((values) => values.join(', ')).join('),\n    (');
 
-    final query = """WITH input_values ($insertColumns) AS (
+    final query = """
+      WITH input_values ($insertColumns) AS (
         VALUES ($inputValues)
-      ), updated_rows AS (
+      ), inserted_rows AS (
+        INSERT INTO $tableName ($insertColumns)
+        SELECT $insertColumnsWithTypes FROM input_values
+        ON CONFLICT ($quotedOnConflicts) DO NOTHING
+        RETURNING id, $insertColumns
+      ), ${skipUpdate ? '' : '''updated_rows AS (
         UPDATE $tableName
           SET $updateSetList FROM input_values
         WHERE $updateWhere
           $distinctOrConditions
-        RETURNING $tableName.*
-      ), unchanged_rows AS (
-        SELECT * FROM $tableName
+          AND NOT EXISTS (
+            SELECT 1 FROM inserted_rows WHERE $updateWhereNotExistsInserted
+          )
+        RETURNING id, $insertColumns
+      ),'''} unchanged_rows AS (
+        SELECT id, $insertColumnsForCompareWithJsonB FROM $tableName
           WHERE ($quotedOnConflicts) IN
             (SELECT $quotedOnConflicts FROM input_values)
-        EXCEPT SELECT * FROM updated_rows
-      ), inserted_rows AS (
-        INSERT INTO $tableName ($insertColumns)
-        SELECT $insertColumns FROM input_values
-        ON CONFLICT ($quotedOnConflicts) DO NOTHING
-        RETURNING $tableName.*
+        EXCEPT (
+          SELECT id, $insertColumnsForCompareWithJsonB FROM inserted_rows
+          ${skipUpdate ? '' : 'UNION ALL SELECT * FROM updated_rows'}
+        )
       ), results AS (
         $selectResultsUnion
       )
-        SELECT * FROM results;
+      SELECT * FROM results;
     """;
 
     try {
@@ -164,7 +184,7 @@ Current type was $T''');
           ? transaction.postgresContext
           : databaseConnection.postgresConnection;
 
-      print('query = $query');
+      // print('query = $query');
 
       var result = await context.mappedResultsQuery(
         query,
@@ -172,6 +192,8 @@ Current type was $T''');
         timeoutInSeconds: 60,
         substitutionValues: {},
       );
+
+      // print('result = $result');
 
       for (var rawRow in result) {
         final value = rawRow.values.first;
@@ -191,6 +213,9 @@ Current type was $T''');
 
     logQuery(session, query, startTime, numRowsAffected: resultsMap.length);
   }
+
+  print(
+      '\tresults: ${resultsMap.keys.map((type) => '${resultsMap[type]!.length} ${type.name}').join(', ')}');
 
   return resultsMap;
 }
