@@ -8,10 +8,11 @@ import 'upsert_return_types.dart';
 Future<Map<UpsertReturnType, List<T>>> upsertAll<T extends TableRow>(
   Session session, {
   required Iterable<T> rows,
-  int batchSize = 100,
   required Set<Column> uniqueBy,
-  List<Column> excludedCriteriaColumns = const [],
-  List<Column> nonUpdatableColumns = const [],
+  int batchSize = 100,
+  Set<Column> updateOnly = const {},
+  Set<Column> ignoreColumns = const {},
+  Set<Column> nonUpdatableColumns = const {},
   Set<UpsertReturnType> returning = UpsertReturnTypes.changes,
   Transaction? transaction,
 }) async {
@@ -21,17 +22,21 @@ Future<Map<UpsertReturnType, List<T>>> upsertAll<T extends TableRow>(
   // Make sure ON CONFLICT column(s) specified.
   assert(uniqueBy.isNotEmpty);
 
-  if (excludedCriteriaColumns.isEmpty) {
-    excludedCriteriaColumns = [
-      ColumnInt('id'),
-      ColumnDateTime('createdAt'),
-      ColumnDateTime('updatedAt'),
-    ];
-  }
+  ignoreColumns = ignoreColumns.union({
+    ColumnInt('id'),
+    ColumnDateTime('createdAt'),
+    ColumnDateTime('updatedAt'),
+  });
 
-  if (nonUpdatableColumns.isEmpty) {
-    nonUpdatableColumns = [ColumnInt('id'), ColumnDateTime('createdAt')];
-  }
+  final ignoreColumnNames = ignoreColumns.map((col) => col.columnName).toSet();
+
+  nonUpdatableColumns = nonUpdatableColumns.union({
+    ColumnInt('id'),
+    ColumnDateTime('createdAt'),
+  });
+
+  final nonUpdatableColumnNames =
+      nonUpdatableColumns.map((col) => col.columnName).toSet();
 
   var table = session.serverpod.serializationManager.getTableForType(T);
   assert(table is Table, '''
@@ -45,62 +50,90 @@ Current type was $T''');
   // Convert all rows to JSON.
   List<Map> dataList = rows.map((row) => row.toJsonForDatabase()).toList();
 
+  final updateOnlyNames = updateOnly.map((col) => col.columnName).toSet();
+
   // Get all columns in the table that are present in the JSON.
   // It only makes sense to include the `id` column if it is in the ON CONFLICT columns.
-  List<Column> columns = table.columns
+  Set<Column> columns = table.columns
       .where((column) =>
           uniqueBy.contains(ColumnInt('id')) || column.columnName != 'id')
       .where((column) =>
           dataList.any((data) => data.containsKey(column.columnName)))
-      .toList();
+      .toSet();
+
+  final uniqueByNames = uniqueBy.map((col) => col.columnName).toSet();
+
+  Set<Column> updateColumns = columns
+      .where((col) =>
+          !nonUpdatableColumnNames.contains(col.columnName) &&
+          !uniqueByNames.contains(col.columnName))
+      .where((col) =>
+          updateOnly.isEmpty || updateOnlyNames.contains(col.columnName))
+      .toSet();
+
+  Set<String> updateColumnNames =
+      updateColumns.map((col) => col.columnName).toSet();
+
+  Set<String> quotedUpdateColumnNames =
+      updateColumnNames.map((colName) => '"$colName"').toSet();
+
   Map<String, String> columnTypes = Map.fromEntries(columns
       .map((column) => MapEntry(column.columnName, column.databaseType)));
-  List<String> columnsList =
-      columns.map((column) => column.columnName).toList();
-  List<String> quotedColumnsList =
-      columnsList.map((columnName) => '"$columnName"').toList();
-  final onConflictColumnsList =
-      uniqueBy.map((column) => '"${column.columnName}"').toList();
-  final skipUpdate =
-      onConflictColumnsList.every((col) => quotedColumnsList.contains(col));
-  final excludedCriteriaColumnsList = excludedCriteriaColumns
-      .map((column) => '"${column.columnName}"')
-      .toList();
-  final nonUpdatableColumnsList =
-      nonUpdatableColumns.map((column) => '"${column.columnName}"').toList();
+  Set<String> columnNames = columns.map((column) => column.columnName).toSet();
+  // Set<String> quotedColumns =
+  //     columnNames.map((columnName) => '"$columnName"').toSet();
+  final onConflictColumns = uniqueBy.map((column) => column.columnName).toSet();
+  final quotedOnConflictColumns =
+      onConflictColumns.map((colName) => '"$colName"').toSet();
+  // final checkColumnsForSkipUpdate = columnNames
+  //     .where((colName) => !ignoreColumnNames.contains(colName))
+  //     .toSet();
+
+  final skipUpdate = updateColumns.isEmpty;
+  // final quotedIgnoreColumns =
+  //     ignoreColumns.map((column) => '"${column.columnName}"').toSet();
+  // final quotedNonUpdatableColumns =
+  //     nonUpdatableColumns.map((column) => '"${column.columnName}"').toSet();
 
   final tableName = table.tableName;
-  final insertColumns = columnsList
+  final insertColumns = columnNames
       .where((column) => column != 'id')
       .map((col) => '"$col"')
       .join(', ');
-  final insertColumnsWithTypes = columnsList
+  final insertColumnsWithTypes = columnNames
       .where((column) => column != 'id')
       .map((col) =>
           columnTypes[col] != null ? '"$col"::${columnTypes[col]!}' : '"$col"')
       .join(', ');
-  final insertColumnsForCompareWithJsonB =
-      insertColumnsWithTypes.replaceAll(RegExp('(?<!jsonb)::json'), '::jsonb');
-  // print('insertColumnsForCompareWithJsonB = $insertColumnsForCompareWithJsonB');
-  final updateSetList = quotedColumnsList
-      .where((column) => !nonUpdatableColumnsList.contains(column))
-      .map((column) => '$column = input_values.$column')
+  // final insertColumnsForCompareWithJsonB =
+  //     insertColumnsWithTypes.replaceAll(RegExp('(?<!jsonb)::json'), '::jsonb');
+  final updateSetList = quotedUpdateColumnNames
+      .where((colName) => !nonUpdatableColumnNames.contains(colName))
+      .map((colName) => '$colName = input_values.$colName')
       .join(',\n    ');
-  final quotedOnConflicts = onConflictColumnsList.join(', ');
-  final updateWhere = onConflictColumnsList
+  final quotedOnConflicts = quotedOnConflictColumns.join(', ');
+  final updateWhere = quotedOnConflictColumns
       .map((column) =>
           '$tableName.$column IS NOT DISTINCT FROM input_values.$column')
       .join(' AND ');
-  final updateWhereNotExistsInserted = onConflictColumnsList
+  final updateWhereNotExistsInserted = quotedOnConflictColumns
       .map((column) =>
           '$tableName.$column IS NOT DISTINCT FROM inserted_rows.$column')
       .join(' AND ');
-  final distinctOrConditionsList = quotedColumnsList
-      .where((column) =>
-          !excludedCriteriaColumnsList.contains(column) &&
-          !onConflictColumnsList.contains(column))
-      .map((column) =>
-          '$tableName.$column IS DISTINCT FROM input_values.$column');
+  // final returningColumns = columnNames
+  //     .where((column) => column != 'id')
+  //     .map((col) => '$tableName."$col"')
+  //     .join(', ');
+
+  final distinctOrConditionsList = columnNames
+      .where(
+        (colName) =>
+            !ignoreColumnNames.contains(colName) &&
+            !onConflictColumns.contains(colName) &&
+            (updateOnly.isEmpty || updateOnlyNames.contains(colName)),
+      )
+      .map((colName) =>
+          '$tableName."$colName" IS DISTINCT FROM input_values."$colName"');
 
   final distinctOrConditions = distinctOrConditionsList.isNotEmpty
       ? 'AND (${distinctOrConditionsList.join(' OR ')})'
@@ -111,11 +144,14 @@ Current type was $T''');
 
   final selectResultsUnion = [
     if (returning.contains(UpsertReturnType.inserted))
-      "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.inserted.index} AS \"returnType\" FROM inserted_rows",
+      // "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.inserted.index} AS \"returnType\" FROM inserted_rows",
+      "SELECT inserted_rows.*, ${UpsertReturnType.inserted.index} AS \"returnType\" FROM inserted_rows",
     if (!skipUpdate && returning.contains(UpsertReturnType.updated))
-      "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.updated.index} AS \"returnType\" FROM updated_rows",
+      // "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.updated.index} AS \"returnType\" FROM updated_rows",
+      "SELECT updated_rows.*, ${UpsertReturnType.updated.index} AS \"returnType\" FROM updated_rows",
     if (returning.contains(UpsertReturnType.unchanged))
-      "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.unchanged.index} AS \"returnType\" FROM unchanged_rows",
+      // "SELECT id, $insertColumnsWithTypes, ${UpsertReturnType.unchanged.index} AS \"returnType\" FROM unchanged_rows",
+      "SELECT unchanged_rows.*, ${UpsertReturnType.unchanged.index} AS \"returnType\" FROM unchanged_rows",
   ].join(' UNION ALL ');
 
   var index = 0;
@@ -153,7 +189,7 @@ Current type was $T''');
         INSERT INTO $tableName ($insertColumns)
         SELECT $insertColumnsWithTypes FROM input_values
         ON CONFLICT ($quotedOnConflicts) DO NOTHING
-        RETURNING id, $insertColumns
+        RETURNING $tableName.*
       ), ${skipUpdate ? '' : '''updated_rows AS (
         UPDATE $tableName
           SET $updateSetList FROM input_values
@@ -162,15 +198,17 @@ Current type was $T''');
           AND NOT EXISTS (
             SELECT 1 FROM inserted_rows WHERE $updateWhereNotExistsInserted
           )
-        RETURNING id, $insertColumns
-      ),'''} unchanged_rows AS (
-        SELECT id, $insertColumnsForCompareWithJsonB FROM $tableName
+        RETURNING $tableName.*
+      ),'''} changed_ids AS (
+          SELECT id FROM inserted_rows
+          ${skipUpdate ? '' : 'UNION ALL SELECT id FROM updated_rows'}
+      ), unchanged_rows AS (
+        SELECT $tableName.* FROM $tableName
           WHERE ($quotedOnConflicts) IN
             (SELECT $quotedOnConflicts FROM input_values)
-        EXCEPT (
-          SELECT id, $insertColumnsForCompareWithJsonB FROM inserted_rows
-          ${skipUpdate ? '' : 'UNION ALL SELECT * FROM updated_rows'}
-        )
+          AND $tableName.id NOT IN (
+            SELECT id FROM changed_ids
+          )
       ), results AS (
         $selectResultsUnion
       )
@@ -184,7 +222,7 @@ Current type was $T''');
           ? transaction.postgresContext
           : databaseConnection.postgresConnection;
 
-      // print('query = $query');
+      print('==========\n\n\nquery = $query\n\n\n==========\n\n\n');
 
       var result = await context.mappedResultsQuery(
         query,
