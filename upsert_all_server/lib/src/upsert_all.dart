@@ -1,233 +1,169 @@
 import 'package:serverpod/serverpod.dart';
+import 'package:collection/collection.dart';
 
 import 'generated/protocol.dart';
 import 'extensions/extensions.dart';
 import 'serverpod_internals/serverpod_internals.dart';
 import 'upsert_return_types.dart';
 
+extension IterableColumnExtension<T extends Column> on Iterable<T> {
+  Iterable<String> get names => map((column) => column.columnName);
+  Iterable<String> get quotedNames => map((column) => '"${column.columnName}"');
+  String get joinedQuotedNames => quotedNames.join(', ');
+}
+
 Future<Map<UpsertReturnType, List<T>>> upsertAll<T extends TableRow>(
   Session session, {
   required Iterable<T> rows,
-  required Set<Column> uniqueBy,
+  required Set<Column> onConflict,
   int batchSize = 100,
+  bool doUpdate = true,
   Set<Column> updateOnly = const {},
   Set<Column> ignoreColumns = const {},
   Set<Column> nonUpdatableColumns = const {},
   Set<UpsertReturnType> returning = UpsertReturnTypes.changes,
   Transaction? transaction,
+  String createdAtName = 'createdAt',
+  String updatedAtName = 'updatedAt',
 }) async {
   // Do nothing if passed an empty list.
   if (rows.isEmpty) return {};
 
-  // Make sure ON CONFLICT column(s) specified.
-  assert(uniqueBy.isNotEmpty);
+  assert(onConflict.isNotEmpty, 'onConflict columns is required.');
 
-  ignoreColumns = ignoreColumns.union({
-    ColumnInt('id'),
-    ColumnDateTime('createdAt'),
-    ColumnDateTime('updatedAt'),
-  });
-
-  final ignoreColumnNames = ignoreColumns.map((col) => col.columnName).toSet();
-
-  nonUpdatableColumns = nonUpdatableColumns.union({
-    ColumnInt('id'),
-    ColumnDateTime('createdAt'),
-  });
-
-  final nonUpdatableColumnNames =
-      nonUpdatableColumns.map((col) => col.columnName).toSet();
-
-  var table = session.serverpod.serializationManager.getTableForType(T);
+  final table = session.serverpod.serializationManager.getTableForType(T);
 
   assert(table is Table, '''
 You need to specify a template type that is a subclass of TableRow.
 E.g. myRows = await session.db.find<MyTableClass>(where: ...);
 Current type was $T''');
+
   if (table == null) return {};
 
-  var startTime = DateTime.now();
+  final tableName = table.tableName;
 
   // Convert all rows to JSON.
   List<Map> dataList = rows.map((row) => row.toJsonForDatabase()).toList();
 
-  final updateOnlyNames = updateOnly.map((col) => col.columnName).toSet();
+  // We should IGNORE the `id` column (UNLESS it is in the ON CONFLICT columns).
+  // We should ALWAYS IGNORE the timestamp columns when comparing,
+  // because they are most likely instantiated in dart and will be different.
+  ignoreColumns = ignoreColumns.union({
+    ColumnInt('id'),
+    ColumnDateTime(createdAtName),
+    ColumnDateTime(updatedAtName),
+  });
 
-  final uniqueByNames = uniqueBy.map((col) => col.columnName).toSet();
+  // It does not make sense to update the ON CONFLICT columns.
+  // We should NEVER UPDATE the created at column.
+  nonUpdatableColumns = nonUpdatableColumns.union({
+    ...onConflict,
+    ColumnDateTime(createdAtName),
+  });
 
   // Get all columns in the table that are present in the JSON.
   // It only makes sense to include the `id` column if it is in the ON CONFLICT columns.
   Set<Column> columns = table.columns
-      .where(
-          (column) => uniqueByNames.contains('id') || column.columnName != 'id')
+      .where((column) => (column.columnName != 'id' ||
+          column.columnName == 'id' && onConflict.names.contains('id')))
       .where((column) =>
           dataList.any((data) => data.containsKey(column.columnName)))
       .toSet();
 
   Set<Column> updateColumns = columns
+      .whereNot((col) => nonUpdatableColumns.names.contains(col.columnName))
       .where((col) =>
-          !nonUpdatableColumnNames.contains(col.columnName) &&
-          !uniqueByNames.contains(col.columnName))
-      .where((col) =>
-          updateOnly.isEmpty || updateOnlyNames.contains(col.columnName))
+          updateOnly.isEmpty || updateOnly.names.contains(col.columnName))
       .toSet();
 
-  Set<String> updateColumnNames =
-      updateColumns.map((col) => col.columnName).toSet();
+  final updateSet = updateColumns.quotedNames
+      .map((col) => '$col = EXCLUDED.$col')
+      .join(',\n        ');
 
-  Set<String> quotedUpdateColumnNames =
-      updateColumnNames.map((colName) => '"$colName"').toSet();
+  final updateWhereNames =
+      {...updateColumns.quotedNames}.difference({...ignoreColumns.quotedNames});
 
-  Map<String, String> columnTypes = Map.fromEntries(columns.map((column) =>
-      MapEntry(column.columnName,
-          column.databaseType.replaceFirst('json', 'jsonb'))));
-  Set<String> columnNames = columns.map((column) => column.columnName).toSet();
-  // Set<String> quotedColumns =
-  //     columnNames.map((columnName) => '"$columnName"').toSet();
-  final onConflictColumns = uniqueBy.map((column) => column.columnName).toSet();
-  final quotedOnConflictColumns =
-      onConflictColumns.map((colName) => '"$colName"').toSet();
-  // final checkColumnsForSkipUpdate = columnNames
-  //     .where((colName) => !ignoreColumnNames.contains(colName))
-  //     .toSet();
+  final updateWhere = updateWhereNames
+      .map((col) => '$tableName.$col IS DISTINCT FROM EXCLUDED.$col')
+      .join('\n        OR ');
 
-  final skipUpdate = updateColumns.isEmpty;
-  // final quotedIgnoreColumns =
-  //     ignoreColumns.map((column) => '"${column.columnName}"').toSet();
-  // final quotedNonUpdatableColumns =
-  //     nonUpdatableColumns.map((column) => '"${column.columnName}"').toSet();
-
-  final tableName = table.tableName;
-  final insertColumns = columnNames.map((col) => '"$col"').join(', ');
-  final insertColumnsWithTypes = columnNames
-      .map((col) =>
-          columnTypes[col] != null ? '"$col"::${columnTypes[col]!}' : '"$col"')
-      .join(', ');
-  final updateSetList = quotedUpdateColumnNames
-      .where((colName) => !nonUpdatableColumnNames.contains(colName))
-      .map((colName) => '$colName = input_values.$colName')
-      .join(',\n    ');
-  final quotedOnConflicts = quotedOnConflictColumns.join(', ');
-  final updateWhere = quotedOnConflictColumns
-      .map((column) =>
-          '$tableName.$column IS NOT DISTINCT FROM input_values.$column')
-      .join(' AND ');
-  final updateWhereNotExistsInserted = quotedOnConflictColumns
-      .map((column) =>
-          '$tableName.$column IS NOT DISTINCT FROM inserted_rows.$column')
-      .join(' AND ');
-  final unchangedWhereExistsInput = quotedOnConflictColumns
-      .map((column) =>
-          '$tableName.$column IS NOT DISTINCT FROM input_values.$column')
-      .join(' AND ');
-
-  final distinctOrConditionsList = columnNames
-      .where(
-        (colName) =>
-            !ignoreColumnNames.contains(colName) &&
-            !onConflictColumns.contains(colName) &&
-            (updateOnly.isEmpty || updateOnlyNames.contains(colName)),
-      )
-      .map((colName) =>
-          '$tableName."$colName"::${columnTypes[colName]!} IS DISTINCT FROM input_values."$colName"::${columnTypes[colName]!}');
-
-  final distinctOrConditions = distinctOrConditionsList.isNotEmpty
-      ? 'AND (${distinctOrConditionsList.join(' OR ')})'
-      : '';
-
-  var batches = dataList.chunked(batchSize);
+  final batches = dataList.chunked(batchSize);
   Map<UpsertReturnType, List<T>> resultsMap = {};
 
-  final selectResultsUnion = [
-    if (returning.contains(UpsertReturnType.inserted))
-      "SELECT inserted_rows.*, ${UpsertReturnType.inserted.index} AS \"returnType\" FROM inserted_rows",
-    if (!skipUpdate && returning.contains(UpsertReturnType.updated))
-      "SELECT updated_rows.*, ${UpsertReturnType.updated.index} AS \"returnType\" FROM updated_rows",
-    if (returning.contains(UpsertReturnType.unchanged))
-      "SELECT unchanged_rows.*, ${UpsertReturnType.unchanged.index} AS \"returnType\" FROM unchanged_rows",
-  ].join(' UNION ALL ');
+  for (int index = 0; index < batches.length; index++) {
+    final batch = batches[index];
 
-  var index = 0;
-  for (var batch in batches) {
     print(
         "upsertAll $tableName batch ${index + 1} of ${batches.length}, size = $batchSize, start = ${index * batchSize}, length = ${batch.length}");
-    index++;
 
-    var valuesList = batch
-        .asMap()
-        .map((index, data) {
-          final rowValues = [];
-          for (var column in columns) {
-            final columnName = column.columnName;
-            var convertedValue =
-                DatabasePoolManager.encoder.convert(data[columnName]);
-            if (index == 0) {
-              // print('columnName $columnName type = ${columnTypes[columnName]}');
-              convertedValue += '::${columnTypes[columnName]}';
-            }
-            rowValues.add(convertedValue);
-          }
-          return MapEntry(index, rowValues);
-        })
-        .values
-        .toList();
+    final valuesList = '\n        (' +
+        batch
+            .map((row) => columns.names.map(
+                (column) => DatabasePoolManager.encoder.convert(row[column])))
+            .map((row) => row.join(', '))
+            .join('),\n        (') +
+        ')';
 
-    final inputValues =
-        valuesList.map((values) => values.join(', ')).join('),\n    (');
+    final onConflictValues = ' (' +
+        batch
+            .map((row) => onConflict.names.map(
+                (column) => DatabasePoolManager.encoder.convert(row[column])))
+            .map((row) => row.join(', '))
+            .join('), (') +
+        ') ';
 
     final query = """
-      WITH input_values ($insertColumns) AS (
-        VALUES ($inputValues)
-      ), inserted_rows AS (
-        INSERT INTO $tableName ($insertColumns)
-        SELECT $insertColumnsWithTypes FROM input_values
-        ON CONFLICT ($quotedOnConflicts) DO NOTHING
-        RETURNING $tableName.*
-      ), ${skipUpdate ? '' : '''updated_rows AS (
-        UPDATE $tableName
-          SET $updateSetList FROM input_values
+      WITH changed AS (
+        INSERT INTO $tableName (${columns.joinedQuotedNames})
+        VALUES $valuesList
+        ON CONFLICT (${onConflict.joinedQuotedNames})
+        """ +
+        ((updateColumns.isNotEmpty && doUpdate)
+            ? """
+        DO UPDATE SET
+          $updateSet
         WHERE $updateWhere
-          $distinctOrConditions
-          AND NOT EXISTS (
-            SELECT 1 FROM inserted_rows WHERE $updateWhereNotExistsInserted
-          )
-        RETURNING $tableName.*
-      ),'''} changed_ids AS (
-          SELECT id FROM inserted_rows
-          ${skipUpdate ? '' : 'UNION ALL SELECT id FROM updated_rows'}
-      ), unchanged_rows AS (
-        SELECT $tableName.* FROM $tableName
-          WHERE EXISTS (
-            SELECT 1 FROM input_values WHERE $unchangedWhereExistsInput
-          )
-          AND $tableName.id NOT IN (
-            SELECT id FROM changed_ids
-          )
-      ), results AS (
-        $selectResultsUnion
+        """
+            : "        DO NOTHING\n") +
+        """RETURNING *, CASE xmax
+            WHEN 0 THEN ${UpsertReturnType.inserted}
+            ELSE ${UpsertReturnType.updated}
+          END AS "returnType"
       )
-      SELECT * FROM results;
+      SELECT * FROM changed
+      UNION ALL
+      SELECT *, ${UpsertReturnType.unchanged} AS "returnType"
+      FROM $tableName
+      WHERE id NOT IN (SELECT id FROM changed)
+      AND (${onConflict.joinedQuotedNames}) IN
+      (
+        $onConflictValues
+      );
     """;
 
-    // print('==========\n\n\nquery = $query\n\n\n==========\n\n\n');
+    // print('==================================');
+    // print(query);
+
+    final startTime = DateTime.now();
 
     try {
-      var databaseConnection = await session.db.databaseConnection;
+      final databaseConnection = await session.db.databaseConnection;
 
-      var context = transaction != null
+      final context = transaction != null
           ? transaction.postgresContext
           : databaseConnection.postgresConnection;
 
-      var result = await context.mappedResultsQuery(
+      final batchResults = await context.mappedResultsQuery(
         query,
         allowReuse: false,
         timeoutInSeconds: 60,
         substitutionValues: {},
       );
 
-      // print('result.length = ${result.length}');
+      // print('batchResults.length = ${batchResults.length}');
+      // print('batchResults = $batchResults');
 
-      for (var rawRow in result) {
+      for (final rawRow in batchResults) {
         final value = rawRow.values.first;
         final returnType = UpsertReturnType.fromJson(value['returnType'])!;
         final row = formatTableRow<T>(
@@ -239,6 +175,8 @@ Current type was $T''');
         ];
       }
     } catch (e, trace) {
+      print('==========\n\n\nquery = $query\n\n\n==========\n\n\n');
+
       logQuery(session, query, startTime, exception: e, trace: trace);
       rethrow;
     }
@@ -251,7 +189,16 @@ Current type was $T''');
   }
 
   print(
-      '\tresults: ${resultsMap.keys.map((type) => '${resultsMap[type]!.length} ${type.name}').join(', ')}');
+      '\tresults: ${resultsMap.keys.map((resultType) => '${resultsMap[resultType]!.length} ${resultType.name}').join(', ')}');
+
+  final inserted = resultsMap[UpsertReturnType.inserted];
+  final updated = resultsMap[UpsertReturnType.updated];
+  if (inserted != null && inserted.isNotEmpty) {
+    print('inserted ids: ${inserted.map((r) => r.id!).join(', ')}');
+  }
+  if (updated != null && updated.isNotEmpty) {
+    print('updated ids: ${updated.map((r) => r.id!).join(', ')}');
+  }
 
   return resultsMap;
 }
