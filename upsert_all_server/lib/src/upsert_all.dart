@@ -12,6 +12,24 @@ extension IterableColumnExtension<T extends Column> on Iterable<T> {
   String get joinedQuotedNames => quotedNames.join(', ');
 }
 
+Future<void> resetIdSequence({
+  required Session session,
+  required String tableName,
+  Transaction? transaction,
+}) async {
+  final databaseConnection = await session.db.databaseConnection;
+
+  final context = transaction != null
+      ? transaction.postgresContext
+      : databaseConnection.postgresConnection;
+
+  /// Reset the sequence to the highest id to avoid weird id INSERT conflicts.
+  /// Comment on SO: "inserting with ids is not updating the incrementor for the column"
+  /// https://stackoverflow.com/questions/44708548/postgres-complains-id-already-exists-after-insert-of-initial-data
+  await context.execute(
+      "SELECT setval('${tableName}_id_seq', max(id)) FROM $tableName;");
+}
+
 Future<Map<UpsertReturnType, List<T>>> upsertAll<T extends TableRow>(
   Session session, {
   required Iterable<T> rows,
@@ -92,6 +110,9 @@ Current type was $T''');
 
   for (int index = 0; index < batches.length; index++) {
     final batch = batches[index];
+
+    await resetIdSequence(
+        session: session, tableName: tableName, transaction: transaction);
 
     print(
         "upsertAll $tableName batch ${index + 1} of ${batches.length}, size = $batchSize, start = ${index * batchSize}, length = ${batch.length}");
@@ -188,17 +209,20 @@ Current type was $T''');
         numRowsAffected: resultsMap.changed.length);
   }
 
+  await resetIdSequence(
+      session: session, tableName: tableName, transaction: transaction);
+
   print(
       '\tresults: ${resultsMap.keys.map((resultType) => '${resultsMap[resultType]!.length} ${resultType.name}').join(', ')}');
 
-  final inserted = resultsMap[UpsertReturnType.inserted];
-  final updated = resultsMap[UpsertReturnType.updated];
-  if (inserted != null && inserted.isNotEmpty) {
-    print('inserted ids: ${inserted.map((r) => r.id!).join(', ')}');
-  }
-  if (updated != null && updated.isNotEmpty) {
-    print('updated ids: ${updated.map((r) => r.id!).join(', ')}');
-  }
+  // final inserted = resultsMap[UpsertReturnType.inserted];
+  // final updated = resultsMap[UpsertReturnType.updated];
+  // if (inserted != null && inserted.isNotEmpty) {
+  //   print('inserted ids: ${inserted.map((r) => r.id!).join(', ')}');
+  // }
+  // if (updated != null && updated.isNotEmpty) {
+  //   print('updated ids: ${updated.map((r) => r.id!).join(', ')}');
+  // }
 
   return resultsMap;
 }
