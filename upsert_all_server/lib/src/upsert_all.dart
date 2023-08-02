@@ -1,8 +1,8 @@
-import 'package:serverpod/serverpod.dart';
 import 'package:collection/collection.dart';
+import 'package:serverpod/serverpod.dart';
 
-import 'generated/protocol.dart';
 import 'extensions/extensions.dart';
+import 'generated/protocol.dart';
 import 'serverpod_internals/serverpod_internals.dart';
 import 'upsert_return_types.dart';
 
@@ -88,6 +88,8 @@ Current type was $T''');
           dataList.any((data) => data.containsKey(column.columnName)))
       .toSet();
 
+  final jsonColumns = columns.whereType<ColumnSerializable>();
+
   Set<Column> updateColumns = columns
       .whereNot((col) => nonUpdatableColumns.names.contains(col.columnName))
       .where((col) =>
@@ -101,9 +103,10 @@ Current type was $T''');
   final updateWhereNames =
       {...updateColumns.quotedNames}.difference({...ignoreColumns.quotedNames});
 
-  final updateWhere = updateWhereNames
-      .map((col) => '$tableName.$col IS DISTINCT FROM EXCLUDED.$col')
-      .join('\n        OR ');
+  final updateWhere = updateWhereNames.map((col) {
+    final toJsonB = jsonColumns.quotedNames.contains(col) ? '::jsonb' : '';
+    return '$tableName.$col$toJsonB IS DISTINCT FROM EXCLUDED.$col$toJsonB';
+  }).join('\n        OR ');
 
   final batches = dataList.chunked(batchSize);
   Map<UpsertReturnType, List<T>> resultsMap = {};
@@ -119,8 +122,15 @@ Current type was $T''');
 
     final valuesList = '\n        (' +
         batch
-            .map((row) => columns.names.map(
-                (column) => DatabasePoolManager.encoder.convert(row[column])))
+            .map((row) => columns.names.map((column) {
+                  final converted =
+                      DatabasePoolManager.encoder.convert(row[column]);
+                  // final isJson = row[column] is Map ||
+                  //     row[column] is List ||
+                  //     row[column] is SerializableEntity;
+                  // return isJson ? '$converted::jsonb' : converted;
+                  return converted;
+                }))
             .map((row) => row.join(', '))
             .join('),\n        (') +
         ')';
