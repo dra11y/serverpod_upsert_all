@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:collection/collection.dart';
 import 'package:serverpod/serverpod.dart';
 
@@ -111,34 +113,57 @@ Current type was $T''');
   final batches = dataList.chunked(batchSize);
   Map<UpsertReturnType, List<T>> resultsMap = {};
 
-  for (int index = 0; index < batches.length; index++) {
-    final batch = batches[index];
+  for (int batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+    final batch = batches[batchIndex];
 
     await resetIdSequence(
         session: session, tableName: tableName, transaction: transaction);
 
     print(
-        "upsertAll $tableName batch ${index + 1} of ${batches.length}, size = $batchSize, start = ${index * batchSize}, length = ${batch.length}");
+        "upsertAll $tableName batch ${batchIndex + 1} of ${batches.length}, size = $batchSize, start = ${batchIndex * batchSize}, length = ${batch.length}");
+
+    final Iterable<MapEntry<String, dynamic>> substitutionValuesEntries = batch
+        .mapIndexed((index, row) => columns.map((column) {
+              final columnName = column.columnName;
+              // final convertedValue =
+              //     DatabasePoolManager.encoder.convert(row[columnName]);
+              // return MapEntry('$columnName$index', convertedValue);
+              final value = column.databaseType == 'json'
+                  // ? '\'${jsonEncode((row[columnName] as SerializableEntity).allToJson())}\':jsonb'
+                  ? jsonEncode(row[columnName])
+                  : row[columnName];
+              return MapEntry('$columnName$index', value);
+            }))
+        .expand((entries) => entries);
+
+    final Map<String, dynamic> substitutionValues =
+        Map.fromEntries(substitutionValuesEntries);
 
     final valuesList = '\n        (' +
         batch
-            .map((row) => columns.names.map((column) {
-                  final converted =
-                      DatabasePoolManager.encoder.convert(row[column]);
-                  // final isJson = row[column] is Map ||
-                  //     row[column] is List ||
-                  //     row[column] is SerializableEntity;
-                  // return isJson ? '$converted::jsonb' : converted;
-                  return converted;
-                }))
+            .mapIndexed((index, row) =>
+                columns.names.map((columnName) => '@$columnName$index'))
             .map((row) => row.join(', '))
             .join('),\n        (') +
         ')';
 
+    final Iterable<MapEntry<String, dynamic>>
+        onConflictSubstitutionValuesEntries = batch
+            .mapIndexed((index, row) => onConflict.names.map((columnName) {
+                  final value = row[columnName] is SerializableEntity
+                      ? '\'${jsonEncode((row[columnName] as SerializableEntity).allToJson())}\':jsonb'
+                      : row[columnName];
+                  return MapEntry('$columnName$index', value);
+                }))
+            .expand((entries) => entries);
+
+    final Map<String, dynamic> onConflictSubstitutionValues =
+        Map.fromEntries(onConflictSubstitutionValuesEntries);
+
     final onConflictValues = ' (' +
         batch
-            .map((row) => onConflict.names.map(
-                (column) => DatabasePoolManager.encoder.convert(row[column])))
+            .mapIndexed((index, row) =>
+                onConflict.names.map((columnName) => '@$columnName$index'))
             .map((row) => row.join(', '))
             .join('), (') +
         ') ';
@@ -188,7 +213,10 @@ Current type was $T''');
         query,
         allowReuse: false,
         timeoutInSeconds: 60,
-        substitutionValues: {},
+        substitutionValues: {
+          ...substitutionValues,
+          ...onConflictSubstitutionValues,
+        },
       );
 
       // print('batchResults.length = ${batchResults.length}');
@@ -197,8 +225,16 @@ Current type was $T''');
       for (final rawRow in batchResults) {
         final value = rawRow.values.first;
         final returnType = UpsertReturnType.fromJson(value['returnType'])!;
-        final row = formatTableRow<T>(
-            session.serverpod.serializationManager, tableName, value);
+        T? row;
+        try {
+          row = formatTableRow<T>(
+              session.serverpod.serializationManager, tableName, value);
+        } catch (error) {
+          print('tableName = $tableName');
+          print('error value = $value');
+          print(error);
+        }
+
         if (row == null) continue;
         resultsMap[returnType] = [
           ...resultsMap[returnType] ?? [],
@@ -207,6 +243,10 @@ Current type was $T''');
       }
     } catch (e, trace) {
       print('==========\n\n\nquery = $query\n\n\n==========\n\n\n');
+      print('==========\n\n\nsubstitutionValues = ${{
+        ...substitutionValues,
+        ...onConflictSubstitutionValues,
+      }}\n\n\n==========\n\n\n');
 
       logQuery(session, query, startTime, exception: e, trace: trace);
       rethrow;
